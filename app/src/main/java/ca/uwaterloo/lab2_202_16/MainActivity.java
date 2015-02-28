@@ -19,6 +19,9 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import java.util.Arrays;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 
 public class MainActivity extends ActionBarActivity {
@@ -40,15 +43,12 @@ public class MainActivity extends ActionBarActivity {
         }
 
         LineGraphView graph;
-
         TextView stepsTextView;
-
         SensorManager sensorManager;
         Sensor accelerometer;
-
-        AccelerometerEventListener a;
-
-        StepCounter stepCounter;
+        SensorEventListener a;
+        StepCounter sc;
+        ScheduledExecutorService stateMachine = Executors.newSingleThreadScheduledExecutor();
 
         @Override
         public void onPause() {
@@ -86,7 +86,7 @@ public class MainActivity extends ActionBarActivity {
                 @Override
                 public void onClick(View v) {
                     graph.purge();
-                    stepCounter.clearSteps();
+                    sc.saveClearSteps();
                 }
             });
             layout.addView(clearButton);
@@ -103,54 +103,46 @@ public class MainActivity extends ActionBarActivity {
 
             stepsTextView = makeTextView(rootView);
 
-            stepCounter = new StepCounter();
+            sc = new StepCounter();
 
-            a = new AccelerometerEventListener(graph, stepCounter, stepsTextView);
+            a = new SensorEventListener() {
+                final float C = 20;
+
+                public void onAccuracyChanged(Sensor s, int i) {}
+
+                /**
+                 * Implementation of a linear acceleration sensor that filters out gravity and a low
+                 * pass filter to filter out noise for a smoother graph
+                 * @param se
+                 */
+                public void onSensorChanged(SensorEvent se) {
+                    if (se.sensor.getType() == Sensor.TYPE_LINEAR_ACCELERATION) {
+                        sc.setAccelX( sc.getAccelX() + (se.values[0] - sc.getAccelX()) / C );
+                        sc.setAccelY(sc.getAccelY() + (se.values[1] - sc.getAccelY()) / C);
+                        sc.setAccelZ( sc.getAccelZ() + (se.values[2] - sc.getAccelZ()) / C );
+                    }
+                }
+            };
 
             sensorManager.registerListener(a, accelerometer,
                     SensorManager.SENSOR_DELAY_FASTEST);
 
-            return rootView;
-        }
-
-        class AccelerometerEventListener implements SensorEventListener {
-            LineGraphView graph;
-            StepCounter stepCounter;
-            TextView stepsTextView;
-            float[] smoothedPoint = new float[] {0,0,0,0};
-            final float C = 10;
-
-            public AccelerometerEventListener(LineGraphView graph, StepCounter stepCounter,
-                                              TextView stepsTextView){
-                this.graph = graph;
-                this.stepCounter = stepCounter;
-                this.stepsTextView = stepsTextView;
-            }
-
-
-            public void onAccuracyChanged(Sensor s, int i) {}
-
-            /**
-             * Implementation of a linear acceleration sensor that filters out gravity and a low
-             * pass filter to filter out noise for a smoother graph
-             * @param se
-             */
-            public void onSensorChanged(SensorEvent se) {
-                if (se.sensor.getType() == Sensor.TYPE_LINEAR_ACCELERATION) {
-                        smoothedPoint[0] += (se.values[0] - smoothedPoint[0]) / C;
-                        smoothedPoint[1] += (se.values[1] - smoothedPoint[1]) / C;
-                        smoothedPoint[2] += (se.values[2] - smoothedPoint[2]) / C;
-
-                    // smoothedPoint[3] is the average of the x, y, and z components, used to
-                    // analyze accelerometer data on the graph for counting a step
-                    smoothedPoint[3] = 0.3f*Math.abs(smoothedPoint[0]) + 0.3f*Math.abs(smoothedPoint[1]) +
-                            0.4f*Math.abs(smoothedPoint[2]);
-
-                    graph.addPoint(smoothedPoint);
-                    stepCounter.evaluate(smoothedPoint);
-                    stepsTextView.setText(String.valueOf(stepCounter.prevSteps()));
+            Runnable periodTask = new Runnable() {
+                @Override
+                public void run() {
+                    sc.evaluate();
+                    stepsTextView.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            graph.addPoint(new float[] {0,0,0,sc.getAccelSum()});
+                            stepsTextView.setText(String.valueOf(sc.prevSteps()));
+                        }
+                    });
                 }
-            }
+            };
+            stateMachine.scheduleAtFixedRate(periodTask,200,5, TimeUnit.MILLISECONDS);
+
+            return rootView;
         }
 
         /**
@@ -158,25 +150,33 @@ public class MainActivity extends ActionBarActivity {
          * human gait. Utilizes a time delay of 200ms and a peak requirement for counting a step.
          */
         class StepCounter {
-            final double THRESHOLD = 0.9;
-            final int DELTATIME = 200;
+            private static final int MAXTIME = 1000;
+            private static final double THRESHOLD = 0.9;
+            private static final int DELTATIME = 200;
+
             int steps;
             int prevSteps;
             long prevTime;
 
+            ToneGenerator toneG = new ToneGenerator(AudioManager.STREAM_ALARM, 50);
             State currentState;
 
+            private float accelX;
+            private float accelY;
+            private float accelZ;
+            private float accelSum;
+
             abstract class State {
-                abstract public State Evaluate(float[] dataPoint);
+                abstract public State evaluate();
             }
 
             /**
              * state1 loops back to itself until the value of dataPoint[3] exceeds THRESHOLD
              */
             State state1 = new State() {
-                public State Evaluate(float[] dataPoint) {
+                public State evaluate() {
                     prevTime = System.currentTimeMillis();
-                    if (dataPoint[3] > THRESHOLD) {
+                    if (accelSum > THRESHOLD) {
                         return state2;
                     }
                     return state1;
@@ -189,16 +189,19 @@ public class MainActivity extends ActionBarActivity {
              * Otherwise, it goes back to state1.
              */
             State state2 = new State() {
-                public State Evaluate(float[] dataPoint) {
-                    if(dataPoint[3] < THRESHOLD) {
-                        if(System.currentTimeMillis() - prevTime > DELTATIME) {
+                public State evaluate() {
+                    if(accelSum < THRESHOLD) {
+                        if(System.currentTimeMillis() - prevTime > DELTATIME &&
+                                System.currentTimeMillis() - prevTime < MAXTIME) {
                             steps++;
-                            ToneGenerator toneG = new ToneGenerator(AudioManager.STREAM_ALARM, 100);
-                            toneG.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200);
+                            toneG.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 50);
                             prevTime = System.currentTimeMillis();
                             return state3;
                         }
                         return state1;
+                    }
+                    else if(accelSum > 3*THRESHOLD) {
+                        return state3;
                     }
                     return state2;
                 }
@@ -209,12 +212,14 @@ public class MainActivity extends ActionBarActivity {
              * elapsed is above DELTATIME
              */
            State state3 = new State() {
-                public State Evaluate(float[] dataPoint) {
-                    if(dataPoint[3] < THRESHOLD) {
-                        if(System.currentTimeMillis() - prevTime > DELTATIME) {
+                public State evaluate() {
+                    if(accelSum < THRESHOLD) {
+                        if (System.currentTimeMillis() - prevTime > MAXTIME) {
+                            return state1;
+                        }
+                        else if(System.currentTimeMillis() - prevTime > 1.5*DELTATIME) {
                             steps++;
-                            ToneGenerator toneG = new ToneGenerator(AudioManager.STREAM_ALARM, 100);
-                            toneG.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200);
+                            toneG.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 50);
                             return state1;
                         }
                     }
@@ -226,15 +231,34 @@ public class MainActivity extends ActionBarActivity {
                 currentState = state1;
             }
 
-            public void evaluate(float[] dataPoint) {
-                currentState = currentState.Evaluate( dataPoint );
+            public void evaluate() {
+                // The average of the x, y, and z components, used to
+                // analyze accelerometer data on the graph for counting a step
+                accelSum = 0.3f * Math.abs(sc.getAccelX()) + 0.3f * Math.abs(sc.getAccelY()) +
+                        0.4f * Math.abs(sc.getAccelZ());
+
+                currentState = currentState.evaluate();
+            }
+
+            public void setAccelX(float in) { this.accelX = in; }
+            public void setAccelY(float in) { this.accelY = in; }
+            public void setAccelZ(float in) { this.accelZ = in; }
+            public void setAccelSum(float in) { this.accelSum = in; }
+
+            public float getAccelX() { return accelX; }
+            public float getAccelY() { return accelY; }
+            public float getAccelZ() { return accelZ; }
+            public float getAccelSum() { return accelSum; }
+
+            public float[] getAccelArray() {
+                return new float[] {accelX, accelY, accelZ, accelSum};
             }
 
             public int prevSteps() {
                 return prevSteps;
             }
 
-            public void clearSteps() {
+            public void saveClearSteps() {
                 prevSteps = steps;
                 steps = 0;
             }
