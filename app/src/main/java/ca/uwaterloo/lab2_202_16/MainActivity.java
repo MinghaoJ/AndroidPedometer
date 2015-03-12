@@ -140,7 +140,7 @@ public class MainActivity extends ActionBarActivity {
                     });
                 }
             };
-            stateMachine.scheduleAtFixedRate(periodTask,200,5, TimeUnit.MILLISECONDS);
+            stateMachine.scheduleAtFixedRate(periodTask,200,25, TimeUnit.MILLISECONDS);
 
             return rootView;
         }
